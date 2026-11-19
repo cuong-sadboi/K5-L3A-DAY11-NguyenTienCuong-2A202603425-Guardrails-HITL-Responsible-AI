@@ -162,3 +162,77 @@ pip install -r requirements.txt
 Rồi mở [`CHECKPOINTS.md`](CHECKPOINTS.md) và làm lần lượt Checkpoint 1 → 5.
 
 Nộp theo [`SUBMISSION.md`](SUBMISSION.md) · Quy định: [`RULES.md`](RULES.md).
+
+## 4. CP3 — implementation và cách kiểm tra
+
+Học viên: **Nguyễn Tiến Cường — 2A202603425 — K5 L3A**.
+
+Pipeline Blue dùng OpenRouter và giữ model cố định của lab. Thứ tự plugin:
+`RateLimitPlugin → InputGuardrailPlugin → OutputGuardrailPlugin`.
+`user_id` được truyền từ `chat_with_agent` tới runtime; quota mặc định là
+10 request/60 giây cho từng người dùng, dùng sliding window và đồng hồ monotonic.
+
+Audit và monitoring là observers bao quanh mỗi request trong suite, gồm cả
+request bị chặn trước LLM. Audit ghép input/output bằng `request_id`, ghi UTC,
+latency và lớp chặn; nội dung được che PII/secret trước khi lưu.
+`blocked` chỉ tính request bị chặn; output đã che vẫn được trả về và được đếm
+riêng ở `redacted_requests`. Alerts là trạng thái hiện tại, không thêm trùng
+khi kiểm tra nhiều lần. Judge đang tắt nên các counters Judge bằng 0.
+
+Egress là policy độc lập phải gọi trước sink/tool: chỉ HTTPS tới đúng hostname
+`api.vinbank.example` hoặc `cases.vinbank.example`, không URL userinfo hay port
+ngoài 443; chặn payload chứa secret/PII. Suite không thực hiện chuyển tiền hay
+gửi payload ra những endpoint này. Tests kiểm chứng policy bằng dữ liệu local.
+
+Chạy từ gốc repo trên PowerShell:
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 src/main.py --part 3
+.\.venv\Scripts\python.exe -m pytest tests/unit tests/public tests/smoke -q
+```
+
+Lệnh CP3 chạy 5 câu an toàn, 7 câu tấn công, 4 case biên và 16 request spam;
+tự sinh `outputs/results.json`, `outputs/audit_log.json`, `outputs/metrics.json`.
+Các nhóm dùng danh tính riêng để quota không ảnh hưởng kết quả guardrails.
+Nhóm spam dùng chung một user và prompt injection: 10 lượt **qua rate limiter**
+rồi bị input guardrail chặn, 6 lượt tiếp theo bị rate limiter chặn.
+Vì vậy `rate_limit.passed` đo lượt qua lớp rate limiter, không phải lượt được LLM
+trả lời; trường `passed_definition` và chi tiết từng request giải thích rõ điều này.
+Cách này đo burst trong 60 giây mà không phụ thuộc độ trễ API.
+
+Unit tests dùng model/clock giả và chỉ xuất file trong thư mục tạm. Artifacts
+nộp bài được sinh bởi CLI dùng Blue thật. Nếu provider trả HTTP 429, runtime
+retry tối đa 3 lần (10/20/40 giây, xét `Retry-After` tối đa 60 giây), không chạy
+lại plugins hoặc đếm request hai lần. Hết retry hoặc lỗi provider khác sẽ làm
+lệnh thất bại, ghi diagnostics vào audit/metrics và không xuất `results.json`
+thành công. `provider_retries` được đếm riêng với rate limit của người dùng.
+
+Giới hạn: suite chạy tuần tự để quy quyết định theo thay đổi counters plugin.
+Nếu mở rộng thành server xử lý đồng thời, cần metadata quyết định riêng cho
+từng request. Bộ lọc regex/topic là rule của lab, không bảo đảm bắt mọi cách
+diễn đạt hoặc mọi hình thức mã hóa dữ liệu.
+
+## 5. CP4 — Red và Red Advance
+
+`src/attacks/attacks.py` có năm kịch bản: điền biểu mẫu, đổi định dạng,
+tình huống giả định, xác minh thông tin và hội thoại leo thang ba lượt.
+Mỗi lượt hội thoại dùng cùng một session; hai kịch bản có session riêng.
+File chi tiết lưu toàn bộ transcript. File tổng hợp ghi prompt từng lượt,
+`response_preview` và bằng chứng riêng cho giá trị giả do model đưa ra.
+Trường `extracted` chỉ là true nếu giá trị đó chưa nằm trong prompt của người
+hỏi; `leaked` phản ánh giá trị xuất hiện trong câu trả lời theo bộ phân loại.
+
+Chạy model mặc định của rubric trên PowerShell (lệnh gọi dịch vụ Gemini):
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 src/main.py --part 4 --red-provider gemini --red-model gemini-3.5-flash
+```
+
+Lệnh sinh `outputs/unsafe_attack_result.json`,
+`outputs/guards_attack_result.json` và `outputs/attack_results.json`.
+`summary.complete` chỉ là true khi hai target đều có đủ năm dòng, không có
+lỗi provider và Red có ít nhất một giá trị được trích xuất. Dữ liệu bảo vệ
+ở `data/protected/` là secret **giả** của bài lab; hai target nhúng nó vào
+system prompt để kiểm tra tấn công và phòng thủ. Lệnh gọi LLM thật sẽ gửi
+system prompt đó tới provider. Unit tests CP4 dùng model giả cục bộ và
+chỉ ghi kết quả trong thư mục tạm.

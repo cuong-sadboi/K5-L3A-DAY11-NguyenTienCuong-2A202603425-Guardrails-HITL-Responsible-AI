@@ -6,12 +6,14 @@ Checkpoint 2 — Output Guardrails
 """
 import re
 import textwrap
+import unicodedata
 
 from google.genai import types
 from google.adk.agents import llm_agent
 from google.adk import runners
 from google.adk.plugins import base_plugin
 
+from core.config import DEMO_SECRETS
 from core.utils import chat_with_agent
 
 
@@ -37,16 +39,30 @@ def content_filter(response: str) -> dict:
         dict with 'safe', 'issues', and 'redacted' keys
     """
     issues = []
+    # Canonicalize hidden separators before matching, including egress/logging.
+    response = "".join(
+        ch for ch in unicodedata.normalize("NFKC", response)
+        if unicodedata.category(ch) != "Cf"
+    )
     redacted = response
 
-    # PII patterns to check
+    # After ":" / "=" any token is a value. After "is"/"là" or a bare space, only
+    # a token that looks like a credential (>= 4 chars with a digit, a symbol such
+    # as @#$% or an inner dot) is redacted, so advice like "reset your password in
+    # the app" stays readable.
+    credential = r"(?=[^\s,;]{4})(?=[^\s,;]*(?:\d|[@#$%^&*_+=/\\|~<>]|\.[^\s,;]))[^\s,;]+"
+
+    # PII & secret patterns to check
     PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
+        "email": r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}",
+        "api_key": r"\bsk-[a-zA-Z0-9_-]+",
+        "password": (
+            r"\b(?:password|mật\s*khẩu)"
+            r"(?:\s*[:=]\s*[^\s,;]+|\s+(?:(?:is|là)\s+)?" + credential + r")"
+        ),
+        "db_host": r"\b[a-zA-Z0-9.-]+\.internal(?::\d+)?\b",
+        "phone": r"(?<!\w)(?:\+84|0)(?:[ .-]?\d){9,10}(?!\d)",
+        "national_id": r"\b(?:\d{12}|\d{9})\b",
     }
 
     for name, pattern in PII_PATTERNS.items():
@@ -54,6 +70,14 @@ def content_filter(response: str) -> dict:
         if matches:
             issues.append(f"{name}: {len(matches)} found")
             redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
+
+    # Extra safety net: redact any raw DEMO secret still present
+    for secret in DEMO_SECRETS:
+        if secret and re.search(re.escape(secret), redacted, re.IGNORECASE):
+            issues.append("secret: 1 found")
+            redacted = re.sub(
+                re.escape(secret), "[REDACTED]", redacted, flags=re.IGNORECASE
+            )
 
     return {
         "safe": len(issues) == 0,
@@ -172,16 +196,32 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        result = content_filter(response_text)
+        if not result["safe"]:
+            self.redacted_count += 1
+            response_text = result["redacted"]
+            llm_response.content = types.Content(
+                role="model",
+                parts=[types.Part.from_text(text=response_text)],
+            )
 
-        return llm_response  # TODO: modify if needed
+        if self.use_llm_judge:
+            judge_result = await llm_safety_check(response_text)
+            if not judge_result["safe"]:
+                self.blocked_count += 1
+                llm_response.content = types.Content(
+                    role="model",
+                    parts=[
+                        types.Part.from_text(
+                            text=(
+                                "I cannot share that response for safety reasons. "
+                                "Please contact VinBank support if you need assistance."
+                            )
+                        )
+                    ],
+                )
+
+        return llm_response
 
 
 # ============================================================

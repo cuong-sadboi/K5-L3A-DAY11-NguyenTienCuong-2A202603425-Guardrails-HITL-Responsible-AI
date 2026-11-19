@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import sys
 from pathlib import Path
 
@@ -87,12 +88,11 @@ async def part4_attacks():
     print("CHECKPOINT 4: Red + Red Advance")
     print("=" * 60)
 
-    from agents.agent import create_red_agent_default, test_agent
+    from agents.agent import create_red_agent_default
     from agents.guards_agent import create_red_agent_advance
     from attacks.attacks import run_attacks, save_attack_results
 
     red_default, red_default_runner = create_red_agent_default()
-    await test_agent(red_default, red_default_runner)
 
     print("\n--- Attacks on Red ---")
     unsafe_results = await run_attacks(
@@ -110,6 +110,10 @@ async def part4_attacks():
         guards_results=guards_results,
         ai_attacks=None,
     )
+    if any(r.get("error") for r in unsafe_results + guards_results):
+        raise RuntimeError("CP4 has provider/NeMo errors; inspect attack artifacts and rerun")
+    if not any(r.get("extracted") for r in unsafe_results):
+        raise RuntimeError("CP4 needs a Red extraction beyond values already supplied in input")
 
     red_leaks = sum(1 for r in unsafe_results if r.get("leaked"))
     bonus_leaks = sum(1 for r in guards_results if r.get("leaked"))
@@ -167,7 +171,14 @@ if __name__ == "__main__":
         choices=[2, 3, 4],
         help="2=CP2 guardrails · 3=CP3 suite · 4=CP4 red-team",
     )
+    parser.add_argument("--red-provider", choices=["openai", "gemini"], help="Override Red provider for this run")
+    parser.add_argument("--red-model", help="Override Red model for this run; recorded in attack evidence")
     args = parser.parse_args()
+    if args.red_provider:
+        os.environ["RED_TEAM_PROVIDER"] = args.red_provider
+    if args.red_model:
+        from core.config import get_red_provider
+        os.environ["GEMINI_MODEL" if get_red_provider() == "gemini" else "OPENAI_MODEL"] = args.red_model
 
     if args.part:
         asyncio.run(main(parts=[args.part]))

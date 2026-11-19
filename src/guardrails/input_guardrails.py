@@ -11,6 +11,7 @@ Status convention (không dùng True/False mơ hồ):
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Literal
 
 from google.genai import types
@@ -42,6 +43,20 @@ InputStatus = Literal["ALLOW", "BLOCK"]
 # Regex is one signal, not the whole security boundary.
 # ============================================================
 
+def _normalize_text(text: str) -> str:
+    """Normalize Unicode and strip invisible/format characters (e.g. zero-width spaces)."""
+    normalized = unicodedata.normalize("NFKC", text)
+    cleaned = "".join(ch for ch in normalized if unicodedata.category(ch) != "Cf")
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def _strip_vietnamese_diacritics(text: str) -> str:
+    """Fold Vietnamese accented characters to ASCII so ALLOWED_TOPICS matches accented input."""
+    text = text.replace("đ", "d").replace("Đ", "D")
+    decomposed = unicodedata.normalize("NFD", text)
+    return "".join(ch for ch in decomposed if unicodedata.category(ch) != "Mn")
+
+
 def detect_injection(user_input: str) -> InputStatus:
     """Detect prompt injection patterns in user input.
 
@@ -51,15 +66,51 @@ def detect_injection(user_input: str) -> InputStatus:
     Returns:
         ``"BLOCK"`` if injection detected (chặn), ``"ALLOW"`` otherwise (cho qua).
     """
+    if not user_input or not user_input.strip():
+        return "ALLOW"
+
+    normalized = _normalize_text(user_input)
+    folded = _strip_vietnamese_diacritics(normalized.lower())
+
     INJECTION_PATTERNS = [
-        # TODO: Add at least 5 regex patterns
-        # Example:
-        # r"ignore (all )?(previous|above) instructions",
+        r"ignore\s+(all\s+)?(previous|above|prior)\s+instructions?",
+        r"disregard\s+(all\s+)?(previous|above|prior)\s+instructions?",
+        r"forget\s+(all\s+)?(previous|above|prior)\s+instructions?",
+        r"you\s+are\s+now\b",
+        r"system\s+prompt",
+        r"reveal\s+(your\s+|the\s+)?(instructions?|prompt|config|internal\s+password|admin\s+password)",
+        r"pretend\s+(you\s+are|to\s+be)",
+        r"act\s+as\s+(a\s+|an\s+)?unrestricted",
+        r"\b(jailbreak|bypass\s+(your\s+)?(rules|guardrails|safety|filters?))\b",
+        r"override\s+(system|safety|security)\s+(rules|instructions?|prompt)",
+    ]
+
+    # Vietnamese counterparts of the groups above, written without accents and
+    # matched on the folded text, so "Bỏ qua mọi hướng dẫn" and "bo qua moi
+    # huong dan" are both caught. Each needs an attack-specific word so normal
+    # questions ("Tôi quên mật khẩu", "bỏ qua hướng dẫn đăng ký") still pass.
+    VIETNAMESE_INJECTION_PATTERNS = [
+        # ignore / forget previous instructions
+        r"\b(?:bo\s+qua|quen|phot\s+lo)\s+(?:(?:moi|tat\s+ca|cac|nhung)\s+)?"
+        r"(?:huong\s+dan|chi\s+dan|chi\s+thi|quy\s+tac)\s+(?:truoc|o\s+tren|ban\s+dau|he\s+thong)\b",
+        # you are now
+        r"\btu\s+(?:gio|bay\s+gio|nay)\s+(?:tro\s+di\s+)?(?:ban|may)\s+(?:se\s+)?la\b",
+        # system prompt
+        r"\b(?:prompt|chi\s+thi)\s+(?:he\s+thong|goc|ban\s+dau)\b",
+        # reveal internal credentials / config
+        r"\b(?:tiet\s+lo|cho\s+(?:toi|minh)\s+xem|doc\s+ra|in\s+ra)\s+(?:(?:cho\s+(?:toi|minh)|het)\s+)?"
+        r"(?:mat\s+khau\s+(?:admin|quan\s+tri|noi\s+bo|he\s+thong)|api\s*key|khoa\s+api"
+        r"|cau\s+hinh|thong\s+tin\s+noi\s+bo)",
+        # act as an unrestricted assistant
+        r"\b(?:dong\s+vai|hoat\s+dong\s+nhu|gia\s+lam)\b.{0,40}?"
+        r"\bkhong\s+(?:bi\s+)?(?:gioi\s+han|rang\s+buoc|kiem\s+duyet)",
     ]
 
     for pattern in INJECTION_PATTERNS:
-        if re.search(pattern, user_input, re.IGNORECASE):
+        if re.search(pattern, normalized, re.IGNORECASE):
             return "BLOCK"
+    if any(re.search(pattern, folded) for pattern in VIETNAMESE_INJECTION_PATTERNS):
+        return "BLOCK"
     return "ALLOW"
 
 
@@ -84,14 +135,30 @@ def topic_filter(user_input: str) -> InputStatus:
         ``"BLOCK"`` = chặn (off-topic hoặc topic cấm).
         ``"ALLOW"`` = cho qua (câu banking hợp lệ).
     """
-    input_lower = user_input.lower()
+    if not user_input or not user_input.strip():
+        return "BLOCK"
 
-    # TODO: Implement logic:
-    # 1. If input contains any blocked topic -> return "BLOCK"
-    # 2. If input doesn't contain any allowed topic -> return "BLOCK"
-    # 3. Otherwise -> return "ALLOW"
+    input_lower = _normalize_text(user_input).lower()
+    input_folded = _strip_vietnamese_diacritics(input_lower)
 
-    pass  # Replace with your implementation
+    for topic in BLOCKED_TOPICS:
+        pattern = rf"\b{re.escape(topic)}"
+        if re.search(pattern, input_lower) or re.search(pattern, input_folded):
+            return "BLOCK"
+
+    # Folding is lossy: "vậy" (so) and "váy" (skirt) both become "vay" (loan).
+    # Only multi-word keywords such as "tai khoan" are matched without accents;
+    # single words must appear as written.
+    if not any(
+        re.search(
+            rf"\b{re.escape(topic)}(?:s)?\b",
+            input_folded if " " in topic else input_lower,
+        )
+        for topic in ALLOWED_TOPICS
+    ):
+        return "BLOCK"
+
+    return "ALLOW"
 
 
 # ============================================================
@@ -144,14 +211,19 @@ class InputGuardrailPlugin(base_plugin.BasePlugin):
         self.total_count += 1
         text = self._extract_text(user_message)
 
-        # TODO: Implement logic:
-        # 1. Call detect_injection(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 2. Call topic_filter(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 3. If both return "ALLOW": return None (let message through)
+        if detect_injection(text) == "BLOCK":
+            self.blocked_count += 1
+            return self._block_response(
+                "I cannot process that request. I can only help with VinBank banking questions."
+            )
 
-        pass  # Replace with your implementation
+        if topic_filter(text) == "BLOCK":
+            self.blocked_count += 1
+            return self._block_response(
+                "I'm a VinBank assistant and can only help with banking-related questions."
+            )
+
+        return None
 
 
 # ============================================================
